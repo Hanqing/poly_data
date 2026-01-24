@@ -1,4 +1,5 @@
 import os
+import json
 import pandas as pd
 from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
@@ -17,14 +18,48 @@ COLUMNS_TO_SAVE = ['timestamp', 'maker', 'makerAssetId', 'makerAmountFilled', 't
 if not os.path.isdir('goldsky'):
     os.mkdir('goldsky')
 
+CURSOR_FILE = 'goldsky/cursor_state.json'
+
+def save_cursor(timestamp, last_id, sticky_timestamp=None):
+    """Save cursor state to file for efficient resume."""
+    state = {
+        'last_timestamp': timestamp,
+        'last_id': last_id,
+        'sticky_timestamp': sticky_timestamp
+    }
+    with open(CURSOR_FILE, 'w') as f:
+        json.dump(state, f)
+
 def get_latest_cursor():
-    """Get the latest timestamp and id from orderFilled.csv, or defaults if file doesn't exist.
-    Returns (timestamp, id) tuple for sticky cursor pagination."""
+    """Get the latest cursor state for efficient resume.
+    Returns (timestamp, last_id, sticky_timestamp) tuple."""
+    # First try to load from cursor state file (most efficient)
+    if os.path.isfile(CURSOR_FILE):
+        try:
+            with open(CURSOR_FILE, 'r') as f:
+                state = json.load(f)
+            timestamp = state.get('last_timestamp', 0)
+            last_id = state.get('last_id')
+            sticky_timestamp = state.get('sticky_timestamp')
+            
+            # Validate cursor state: if sticky_timestamp is set, last_id must also be set
+            if sticky_timestamp is not None and last_id is None:
+                print(f"Warning: Invalid cursor state (sticky_timestamp={sticky_timestamp} but last_id=None), clearing sticky state")
+                sticky_timestamp = None
+            
+            if timestamp > 0:
+                readable_time = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                print(f'Resuming from cursor state: timestamp {timestamp} ({readable_time}), id: {last_id}, sticky: {sticky_timestamp}')
+                return timestamp, last_id, sticky_timestamp
+        except Exception as e:
+            print(f"Error reading cursor file: {e}")
+    
+    # Fallback: read from CSV file
     cache_file = 'goldsky/orderFilled.csv'
     
     if not os.path.isfile(cache_file):
         print("No existing file found, starting from beginning of time (timestamp 0)")
-        return 0, None
+        return 0, None, None
     
     try:
         # Use tail to get the last line efficiently
@@ -41,10 +76,9 @@ def get_latest_cursor():
                 if len(values) > timestamp_index:
                     last_timestamp = int(values[timestamp_index])
                     readable_time = datetime.fromtimestamp(last_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                    print(f'Resuming from timestamp {last_timestamp} ({readable_time})')
-                    # Return timestamp - 1 so we re-fetch from that timestamp with id_gt
-                    # This ensures we don't miss any events if we crashed mid-timestamp
-                    return last_timestamp - 1, None
+                    print(f'Resuming from CSV (no cursor file): timestamp {last_timestamp} ({readable_time})')
+                    # Go back 1 second to ensure no data loss (may create some duplicates)
+                    return last_timestamp - 1, None, None
     except Exception as e:
         print(f"Error reading latest file with tail: {e}")
         # Fallback to pandas
@@ -53,28 +87,24 @@ def get_latest_cursor():
             if len(df) > 0 and 'timestamp' in df.columns:
                 last_timestamp = df.iloc[-1]['timestamp']
                 readable_time = datetime.fromtimestamp(int(last_timestamp), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                print(f'Resuming from timestamp {last_timestamp} ({readable_time})')
-                return int(last_timestamp) - 1, None
+                print(f'Resuming from CSV (no cursor file): timestamp {last_timestamp} ({readable_time})')
+                return int(last_timestamp) - 1, None, None
         except Exception as e2:
             print(f"Error reading with pandas: {e2}")
     
     # Fallback to beginning of time
     print("Falling back to beginning of time (timestamp 0)")
-    return 0, None
+    return 0, None, None
 
 def scrape(at_once=1000):
     QUERY_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
     print(f"Query URL: {QUERY_URL}")
     print(f"Runtime timestamp: {RUNTIME_TIMESTAMP}")
     
-    # Get starting cursor from latest file
-    last_timestamp, last_id = get_latest_cursor()
+    # Get starting cursor from latest file (includes sticky state for perfect resume)
+    last_timestamp, last_id, sticky_timestamp = get_latest_cursor()
     count = 0
     total_records = 0
-    
-    # Sticky cursor state: when a timestamp has >1000 events, we stay at that timestamp
-    # and paginate by id until exhausted
-    sticky_timestamp = None
 
     print(f"\nStarting scrape for orderFilledEvents")
     
@@ -184,10 +214,17 @@ def scrape(at_once=1000):
             df_to_save.to_csv(output_file, index=None, mode='a', header=None)
         else:
             df_to_save.to_csv(output_file, index=None)
+        
+        # Save cursor state for efficient resume (no duplicates on restart)
+        save_cursor(last_timestamp, last_id, sticky_timestamp)
 
         if len(df) < at_once and sticky_timestamp is None:
             break
 
+    # Clear cursor file on successful completion
+    if os.path.isfile(CURSOR_FILE):
+        os.remove(CURSOR_FILE)
+    
     print(f"Finished scraping orderFilledEvents")
     print(f"Total new records: {total_records}")
     print(f"Output file: {output_file}")
